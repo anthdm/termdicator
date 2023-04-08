@@ -12,7 +12,16 @@ import (
 	"github.com/nsf/termbox-go"
 )
 
-const wsendpoint = "wss://fstream.binance.com/stream?streams=btcusdt@depth"
+const wsendpoint = "wss://fstream.binance.com/stream?streams=btcusdt@markPrice/btcusdt@depth"
+
+var (
+	WIDTH         = 0
+	HEIGHT        = 0
+	currMarkPrice = 0.0
+	prevMarkPrice = 0.0
+	ARROW_UP      = '↑'
+	ARROW_DOWN    = '↓'
+)
 
 func byBestBid(a, b *OrderbookEntry) bool {
 	return a.Price >= b.Price
@@ -65,16 +74,18 @@ func getAskByPrice(price float64) btree.CompareAgainst[*OrderbookEntry] {
 	}
 }
 
-func (ob *Orderbook) handleDepthResponse(res BinanceDepthResult) {
-	for _, ask := range res.Asks {
-		price, _ := strconv.ParseFloat(ask[0], 64)
-		volume, _ := strconv.ParseFloat(ask[1], 64)
-		if volume == 0 {
-			if entry, ok := ob.Asks.Get(getAskByPrice(price)); ok {
-				// fmt.Printf("-- deleting level %.2f", price)
+func (ob *Orderbook) handleDepthResponse(asks, bids []any) {
+	for _, v := range asks {
+		ask := v.([]any)
+		price, _ := strconv.ParseFloat(ask[0].(string), 64)
+		volume, _ := strconv.ParseFloat(ask[1].(string), 64)
+		if entry, ok := ob.Asks.Get(getAskByPrice(price)); ok {
+			if volume == 0 {
 				ob.Asks.Delete(entry)
+			} else {
+				entry.Volume = volume
 			}
-			return
+			continue
 		}
 		entry := &OrderbookEntry{
 			Price:  price,
@@ -82,15 +93,17 @@ func (ob *Orderbook) handleDepthResponse(res BinanceDepthResult) {
 		}
 		ob.Asks.Insert(entry)
 	}
-	for _, bid := range res.Bids {
-		price, _ := strconv.ParseFloat(bid[0], 64)
-		volume, _ := strconv.ParseFloat(bid[1], 64)
-		if volume == 0 {
-			if entry, ok := ob.Bids.Get(getBidByPrice(price)); ok {
-				// fmt.Printf("-- deleting level %.2f", price)
+	for _, v := range bids {
+		bid := v.([]any)
+		price, _ := strconv.ParseFloat(bid[0].(string), 64)
+		volume, _ := strconv.ParseFloat(bid[1].(string), 64)
+		if entry, ok := ob.Bids.Get(getBidByPrice(price)); ok {
+			if volume == 0 {
 				ob.Bids.Delete(entry)
+			} else {
+				entry.Volume = volume
 			}
-			return
+			continue
 		}
 		entry := &OrderbookEntry{
 			Price:  price,
@@ -100,25 +113,71 @@ func (ob *Orderbook) handleDepthResponse(res BinanceDepthResult) {
 	}
 }
 
-func (ob *Orderbook) render(x, y int) {
-	it := ob.Asks.Iterator(nil, nil)
-	i := 0
+func (ob *Orderbook) getBids() []*OrderbookEntry {
+	var (
+		depth = 10
+		bids  = make([]*OrderbookEntry, depth)
+		it    = ob.Bids.Iterator(nil, nil)
+		i     = 0
+	)
 	for it.Next() {
-		item := it.Item()
-		priceStr := fmt.Sprintf("%.2f", item.Price)
-		renderText(x, y+i, priceStr, termbox.ColorRed)
+		if i == depth {
+			break
+		}
+		bids[i] = it.Item()
 		i++
 	}
+	it.Release()
+	return bids
+}
 
-	it = ob.Bids.Iterator(nil, nil)
-	i = 0
-	x = x + 10
+func (ob *Orderbook) getAsks() []*OrderbookEntry {
+	var (
+		depth = 10
+		asks  = make([]*OrderbookEntry, depth)
+		it    = ob.Asks.Iterator(nil, nil)
+		i     = 0
+	)
 	for it.Next() {
-		item := it.Item()
-		priceStr := fmt.Sprintf("%.2f", item.Price)
-		renderText(x, y+i, priceStr, termbox.ColorGreen)
+		if i == depth {
+			break
+		}
+		asks[i] = it.Item()
 		i++
 	}
+	it.Release()
+	return asks
+}
+
+func (ob *Orderbook) render(x, y int) {
+	// render the orderbook left frame border
+	for i := 0; i < HEIGHT; i++ {
+		termbox.SetCell(WIDTH-22, i, '|', termbox.ColorWhite, termbox.ColorDefault)
+	}
+	for i, ask := range ob.getAsks() {
+		if ask == nil {
+			continue
+		}
+		price := fmt.Sprintf("%.2f", ask.Price)
+		volume := fmt.Sprintf("%.2f", ask.Volume)
+		renderText(x, y+i, price, termbox.ColorRed)
+		renderText(x+10, y+i, volume, termbox.ColorCyan)
+	}
+	for i, bid := range ob.getBids() {
+		if bid == nil {
+			continue
+		}
+		price := fmt.Sprintf("%.2f", bid.Price)
+		volume := fmt.Sprintf("%.2f", bid.Volume)
+		renderText(x, 10+i, price, termbox.ColorGreen)
+		renderText(x+10, 10+i, volume, termbox.ColorCyan)
+	}
+}
+
+type BinanceTradeResult struct {
+	Data struct {
+		Price string `json:"p"`
+	} `json:"data"`
 }
 
 type BinanceDepthResult struct {
@@ -134,6 +193,7 @@ type BinanceDepthResponse struct {
 
 func main() {
 	termbox.Init()
+	WIDTH, HEIGHT = termbox.Size()
 
 	conn, _, err := websocket.DefaultDialer.Dial(wsendpoint, nil)
 	if err != nil {
@@ -141,38 +201,91 @@ func main() {
 	}
 
 	var (
-		ob     = NewOrderbook()
-		result BinanceDepthResponse
+		ob = NewOrderbook()
+		// result BinanceDepthResponse
+		result map[string]any
 	)
 	go func() {
 		for {
 			if err := conn.ReadJSON(&result); err != nil {
 				log.Fatal(err)
 			}
-			ob.handleDepthResponse(result.Data)
-
+			stream := result["stream"]
+			if stream == "btcusdt@depth" {
+				data := result["data"].(map[string]any)
+				asks := data["a"].([]any)
+				bids := data["b"].([]any)
+				ob.handleDepthResponse(asks, bids)
+			}
+			// each 3s
+			if stream == "btcusdt@markPrice" {
+				prevMarkPrice = currMarkPrice
+				data := result["data"].(map[string]any)
+				priceStr := data["p"].(string)
+				currMarkPrice, _ = strconv.ParseFloat(priceStr, 64)
+			}
 		}
 	}()
 
 	isrunning := true
+	eventch := make(chan termbox.Event, 1)
 	go func() {
-		time.Sleep(time.Second * 60)
-		isrunning = false
+		for {
+			eventch <- termbox.PollEvent()
+		}
 	}()
-
 	for isrunning {
-		// switch ev := termbox.PollEvent(); ev.Type {
-		// case termbox.EventKey:
-		// 	switch ev.Key {
-		// 	case termbox.KeySpace:
-		// 	case termbox.KeyEsc:
-		// 		break loop
-		// 	}
-		// }
+		select {
+		case event := <-eventch:
+			switch event.Key {
+			case termbox.KeyEsc:
+				isrunning = false
+			}
+		default:
+		}
 		termbox.Clear(termbox.ColorDefault, termbox.ColorDefault)
-		ob.render(0, 0)
+		render()
+		ob.render(WIDTH-18, 2)
+		time.Sleep(time.Millisecond * 16)
 		termbox.Flush()
 	}
+}
+
+func renderMarketPrice() {
+	color := termbox.ColorRed
+	arrow := ARROW_DOWN
+	if currMarkPrice > prevMarkPrice {
+		color = termbox.ColorGreen
+		arrow = ARROW_UP
+	}
+	renderText(2, 1, fmt.Sprintf("%.2f", currMarkPrice), color)
+	renderText(10, 1, string(arrow), color)
+}
+
+func render() {
+	// render the window frame border
+	for i := 0; i < WIDTH; i++ {
+		termbox.SetCell(i, 0, '-', termbox.ColorWhite, termbox.ColorDefault)
+		termbox.SetCell(i, HEIGHT-1, '-', termbox.ColorWhite, termbox.ColorDefault)
+	}
+	for i := 0; i < HEIGHT; i++ {
+		termbox.SetCell(0, i, '|', termbox.ColorWhite, termbox.ColorDefault)
+		termbox.SetCell(WIDTH-1, i, '|', termbox.ColorWhite, termbox.ColorDefault)
+	}
+
+	// render the misc border
+	for i := 0; i < WIDTH; i++ {
+		termbox.SetCell(i, 2, '-', termbox.ColorWhite, termbox.ColorDefault)
+	}
+	renderMarketPrice()
+}
+
+// U+2191 -> arrow
+func renderLine(start, end int, color termbox.Attribute) {
+	// for i := 0; i < end-start; i++ {
+	// 	termbox.SetCell(0, i, '|', termbox.ColorWhite, termbox.ColorDefault)
+	// 	termbox.SetCell(WIDTH-1, i, '|', termbox.ColorWhite, termbox.ColorDefault)
+	// }
 }
 
 func renderText(x int, y int, msg string, color termbox.Attribute) {
@@ -180,27 +293,5 @@ func renderText(x int, y int, msg string, color termbox.Attribute) {
 		termbox.SetCell(x, y, ch, color, termbox.ColorDefault)
 		w := runewidth.RuneWidth(ch)
 		x += w
-	}
-}
-
-func _main() {
-	conn, _, err := websocket.DefaultDialer.Dial(wsendpoint, nil)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	var (
-		ob     = NewOrderbook()
-		result BinanceDepthResponse
-	)
-	for {
-		if err := conn.ReadJSON(&result); err != nil {
-			log.Fatal(err)
-		}
-		ob.handleDepthResponse(result.Data)
-		it := ob.Asks.Iterator(nil, nil)
-		for it.Next() {
-			fmt.Printf("%+v\n", it.Item())
-		}
 	}
 }
