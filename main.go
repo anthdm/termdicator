@@ -3,10 +3,10 @@ package main
 import (
 	"fmt"
 	"log"
+	"sort"
 	"strconv"
 	"time"
 
-	"github.com/VictorLowther/btree"
 	"github.com/gorilla/websocket"
 	"github.com/mattn/go-runewidth"
 	"github.com/nsf/termbox-go"
@@ -23,54 +23,32 @@ var (
 	ARROW_DOWN    = '↓'
 )
 
-func byBestBid(a, b *OrderbookEntry) bool {
-	return a.Price >= b.Price
-}
-
-func byBestAsk(a, b *OrderbookEntry) bool {
-	return a.Price < b.Price
-}
-
 type OrderbookEntry struct {
 	Price  float64
 	Volume float64
 }
 
+type byBestAsk []OrderbookEntry
+
+func (a byBestAsk) Len() int           { return len(a) }
+func (a byBestAsk) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a byBestAsk) Less(i, j int) bool { return a[i].Price < a[j].Price }
+
+type byBestBid []OrderbookEntry
+
+func (a byBestBid) Len() int           { return len(a) }
+func (a byBestBid) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a byBestBid) Less(i, j int) bool { return a[i].Price > a[j].Price }
+
 type Orderbook struct {
-	Asks *btree.Tree[*OrderbookEntry]
-	Bids *btree.Tree[*OrderbookEntry]
+	Asks map[float64]float64
+	Bids map[float64]float64
 }
 
 func NewOrderbook() *Orderbook {
 	return &Orderbook{
-		Asks: btree.New(byBestAsk),
-		Bids: btree.New(byBestBid),
-	}
-}
-
-func getBidByPrice(price float64) btree.CompareAgainst[*OrderbookEntry] {
-	return func(e *OrderbookEntry) int {
-		switch {
-		case e.Price > price:
-			return -1
-		case e.Price < price:
-			return 1
-		default:
-			return 0
-		}
-	}
-}
-
-func getAskByPrice(price float64) btree.CompareAgainst[*OrderbookEntry] {
-	return func(e *OrderbookEntry) int {
-		switch {
-		case e.Price < price:
-			return -1
-		case e.Price > price:
-			return 1
-		default:
-			return 0
-		}
+		Asks: make(map[float64]float64),
+		Bids: make(map[float64]float64),
 	}
 }
 
@@ -79,74 +57,72 @@ func (ob *Orderbook) handleDepthResponse(asks, bids []any) {
 		ask := v.([]any)
 		price, _ := strconv.ParseFloat(ask[0].(string), 64)
 		volume, _ := strconv.ParseFloat(ask[1].(string), 64)
-		if entry, ok := ob.Asks.Get(getAskByPrice(price)); ok {
-			if volume == 0 {
-				ob.Asks.Delete(entry)
-			} else {
-				entry.Volume = volume
-			}
-			continue
-		}
-		entry := &OrderbookEntry{
-			Price:  price,
-			Volume: volume,
-		}
-		ob.Asks.Insert(entry)
+		ob.addAsk(price, volume)
 	}
 	for _, v := range bids {
-		bid := v.([]any)
-		price, _ := strconv.ParseFloat(bid[0].(string), 64)
-		volume, _ := strconv.ParseFloat(bid[1].(string), 64)
-		if entry, ok := ob.Bids.Get(getBidByPrice(price)); ok {
-			if volume == 0 {
-				ob.Bids.Delete(entry)
-			} else {
-				entry.Volume = volume
-			}
-			continue
+		ask := v.([]any)
+		price, _ := strconv.ParseFloat(ask[0].(string), 64)
+		volume, _ := strconv.ParseFloat(ask[1].(string), 64)
+		ob.addBid(price, volume)
+	}
+}
+
+func (ob *Orderbook) addBid(price, volume float64) {
+	if _, ok := ob.Bids[price]; ok {
+		if volume == 0.0 {
+			delete(ob.Bids, price)
+			return
 		}
-		entry := &OrderbookEntry{
+	}
+	ob.Bids[price] = volume
+}
+
+func (ob *Orderbook) addAsk(price, volume float64) {
+	if volume == 0 {
+		delete(ob.Asks, price)
+		return
+	}
+	ob.Asks[price] = volume
+}
+
+func (ob *Orderbook) getBids() []OrderbookEntry {
+	depth := 10
+	entries := make(byBestBid, len(ob.Bids))
+	i := 0
+	for price, volume := range ob.Bids {
+		entries[i] = OrderbookEntry{
 			Price:  price,
 			Volume: volume,
 		}
-		ob.Bids.Insert(entry)
-	}
-}
-
-func (ob *Orderbook) getBids() []*OrderbookEntry {
-	var (
-		depth = 10
-		bids  = make([]*OrderbookEntry, depth)
-		it    = ob.Bids.Iterator(nil, nil)
-		i     = 0
-	)
-	for it.Next() {
-		if i == depth {
-			break
-		}
-		bids[i] = it.Item()
 		i++
 	}
-	it.Release()
-	return bids
+	sort.Sort(entries)
+	var want byBestAsk
+	if len(entries) >= depth {
+		want = byBestAsk(entries[:depth])
+	} else {
+		want = byBestAsk(entries)
+	}
+	sort.Sort(want)
+	return want
 }
 
-func (ob *Orderbook) getAsks() []*OrderbookEntry {
-	var (
-		depth = 10
-		asks  = make([]*OrderbookEntry, depth)
-		it    = ob.Asks.Iterator(nil, nil)
-		i     = 0
-	)
-	for it.Next() {
-		if i == depth {
-			break
+func (ob *Orderbook) getAsks() []OrderbookEntry {
+	depth := 10
+	entries := make(byBestAsk, len(ob.Asks))
+	i := 0
+	for price, volume := range ob.Asks {
+		entries[i] = OrderbookEntry{
+			Price:  price,
+			Volume: volume,
 		}
-		asks[i] = it.Item()
 		i++
 	}
-	it.Release()
-	return asks
+	sort.Sort(entries)
+	if len(entries) >= depth {
+		return entries[:depth]
+	}
+	return entries
 }
 
 func (ob *Orderbook) render(x, y int) {
@@ -155,20 +131,14 @@ func (ob *Orderbook) render(x, y int) {
 		termbox.SetCell(WIDTH-22, i, '|', termbox.ColorWhite, termbox.ColorDefault)
 	}
 	for i, ask := range ob.getAsks() {
-		if ask == nil {
-			continue
-		}
 		price := fmt.Sprintf("%.2f", ask.Price)
-		volume := fmt.Sprintf("%.2f", ask.Volume)
+		volume := fmt.Sprintf("%.3f", ask.Volume)
 		renderText(x, y+i, price, termbox.ColorRed)
 		renderText(x+10, y+i, volume, termbox.ColorCyan)
 	}
-	for i, bid := range ob.getBids() {
-		if bid == nil {
-			continue
-		}
-		price := fmt.Sprintf("%.2f", bid.Price)
-		volume := fmt.Sprintf("%.2f", bid.Volume)
+	for i, ask := range ob.getBids() {
+		price := fmt.Sprintf("%.2f", ask.Price)
+		volume := fmt.Sprintf("%.3f", ask.Volume)
 		renderText(x, 10+i, price, termbox.ColorGreen)
 		renderText(x+10, 10+i, volume, termbox.ColorCyan)
 	}
