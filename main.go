@@ -7,9 +7,9 @@ import (
 	"strconv"
 	"time"
 
+	ui "github.com/gizak/termui/v3"
+	"github.com/gizak/termui/v3/widgets"
 	"github.com/gorilla/websocket"
-	"github.com/mattn/go-runewidth"
-	"github.com/nsf/termbox-go"
 )
 
 const wsendpoint = "wss://fstream.binance.com/stream?streams=btcusdt@markPrice/btcusdt@depth"
@@ -19,8 +19,9 @@ var (
 	HEIGHT        = 0
 	currMarkPrice = 0.0
 	prevMarkPrice = 0.0
-	ARROW_UP      = '↑'
-	ARROW_DOWN    = '↓'
+	fundingRate   = "n/a"
+	ARROW_UP      = "↑"
+	ARROW_DOWN    = "↓"
 )
 
 type OrderbookEntry struct {
@@ -90,6 +91,9 @@ func (ob *Orderbook) getBids() []OrderbookEntry {
 	entries := make(byBestBid, len(ob.Bids))
 	i := 0
 	for price, volume := range ob.Bids {
+		if volume == 0 {
+			continue
+		}
 		entries[i] = OrderbookEntry{
 			Price:  price,
 			Volume: volume,
@@ -97,14 +101,17 @@ func (ob *Orderbook) getBids() []OrderbookEntry {
 		i++
 	}
 	sort.Sort(entries)
-	var want byBestAsk
+	// var want byBestAsk
+	// if len(entries) >= depth {
+	// 	want = byBestAsk(entries[:depth])
+	// } else {
+	// 	want = byBestAsk(entries)
+	// }
+	// sort.Sort(want)
 	if len(entries) >= depth {
-		want = byBestAsk(entries[:depth])
-	} else {
-		want = byBestAsk(entries)
+		return entries[:depth]
 	}
-	sort.Sort(want)
-	return want
+	return entries
 }
 
 func (ob *Orderbook) getAsks() []OrderbookEntry {
@@ -125,25 +132,6 @@ func (ob *Orderbook) getAsks() []OrderbookEntry {
 	return entries
 }
 
-func (ob *Orderbook) render(x, y int) {
-	// render the orderbook left frame border
-	for i := 0; i < HEIGHT; i++ {
-		termbox.SetCell(WIDTH-22, i, '|', termbox.ColorWhite, termbox.ColorDefault)
-	}
-	for i, ask := range ob.getAsks() {
-		price := fmt.Sprintf("%.2f", ask.Price)
-		volume := fmt.Sprintf("%.3f", ask.Volume)
-		renderText(x, y+i, price, termbox.ColorRed)
-		renderText(x+10, y+i, volume, termbox.ColorCyan)
-	}
-	for i, ask := range ob.getBids() {
-		price := fmt.Sprintf("%.2f", ask.Price)
-		volume := fmt.Sprintf("%.3f", ask.Volume)
-		renderText(x, 10+i, price, termbox.ColorGreen)
-		renderText(x+10, 10+i, volume, termbox.ColorCyan)
-	}
-}
-
 type BinanceTradeResult struct {
 	Data struct {
 		Price string `json:"p"`
@@ -162,17 +150,16 @@ type BinanceDepthResponse struct {
 }
 
 func main() {
-	termbox.Init()
-	WIDTH, HEIGHT = termbox.Size()
+	if err := ui.Init(); err != nil {
+		log.Fatal(err)
+	}
 
 	conn, _, err := websocket.DefaultDialer.Dial(wsendpoint, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
-
 	var (
-		ob = NewOrderbook()
-		// result BinanceDepthResponse
+		ob     = NewOrderbook()
 		result map[string]any
 	)
 	go func() {
@@ -192,76 +179,71 @@ func main() {
 				prevMarkPrice = currMarkPrice
 				data := result["data"].(map[string]any)
 				priceStr := data["p"].(string)
+				fundingRate = data["r"].(string)
 				currMarkPrice, _ = strconv.ParseFloat(priceStr, 64)
 			}
 		}
 	}()
 
 	isrunning := true
-	eventch := make(chan termbox.Event, 1)
-	go func() {
-		for {
-			eventch <- termbox.PollEvent()
-		}
-	}()
+
+	margin := 2
+	pheight := 3
+
+	pticker := widgets.NewParagraph()
+	pticker.Title = "Binancef"
+	pticker.Text = "[BTCUSDT](fg:cyan)"
+	pticker.SetRect(0, 0, 14, pheight)
+
+	pprice := widgets.NewParagraph()
+	pprice.Title = "Market price"
+	ppriceOffset := 14 + 14 + margin + 2
+	pprice.SetRect(14+margin, 0, ppriceOffset, pheight)
+
+	pfund := widgets.NewParagraph()
+	pfund.Title = "Funding rate"
+	pfund.SetRect(ppriceOffset+margin, 0, ppriceOffset+margin+16, 3)
+
+	tob := widgets.NewTable()
+	out := make([][]string, 20)
+	for i := 0; i < 20; i++ {
+		out[i] = []string{"n/a", "n/a"}
+	}
+	tob.TextStyle = ui.NewStyle(ui.ColorWhite)
+	tob.SetRect(0, pheight+2, 30, 22+pheight+2)
+	tob.PaddingBottom = 0
+	tob.PaddingTop = 0
+	tob.RowSeparator = false
+	tob.TextAlignment = ui.AlignCenter
 	for isrunning {
-		select {
-		case event := <-eventch:
-			switch event.Key {
-			case termbox.KeyEsc:
-				isrunning = false
+		var (
+			asks = ob.getAsks()
+			bids = ob.getBids()
+			// it   = 0
+		)
+		if len(asks) >= 10 {
+			for i := 0; i < 10; i++ {
+				out[i] = []string{fmt.Sprintf("[%.2f](fg:red)", asks[i].Price), fmt.Sprintf("[%.2f](fg:cyan)", asks[i].Volume)}
 			}
-		default:
 		}
-		termbox.Clear(termbox.ColorDefault, termbox.ColorDefault)
-		render()
-		ob.render(WIDTH-18, 2)
-		time.Sleep(time.Millisecond * 16)
-		termbox.Flush()
+		if len(bids) >= 10 {
+			for i := 0; i < 10; i++ {
+				out[i+10] = []string{fmt.Sprintf("[%.2f](fg:green)", bids[i].Price), fmt.Sprintf("[%.2f](fg:cyan)", bids[i].Volume)}
+			}
+		}
+		tob.Rows = out
+
+		pprice.Text = getMarketPrice()
+		pfund.Text = fmt.Sprintf("[%s](fg:yellow)", fundingRate)
+		ui.Render(pticker, pprice, pfund, tob)
+		time.Sleep(time.Millisecond * 20)
 	}
 }
 
-func renderMarketPrice() {
-	color := termbox.ColorRed
-	arrow := ARROW_DOWN
-	if currMarkPrice > prevMarkPrice {
-		color = termbox.ColorGreen
-		arrow = ARROW_UP
+func getMarketPrice() string {
+	price := fmt.Sprintf("[%s %.2f](fg:green)", ARROW_UP, currMarkPrice)
+	if prevMarkPrice > currMarkPrice {
+		price = fmt.Sprintf("[%s %.2f](fg:red)", ARROW_DOWN, currMarkPrice)
 	}
-	renderText(2, 1, fmt.Sprintf("%.2f", currMarkPrice), color)
-	renderText(10, 1, string(arrow), color)
-}
-
-func render() {
-	// render the window frame border
-	for i := 0; i < WIDTH; i++ {
-		termbox.SetCell(i, 0, '-', termbox.ColorWhite, termbox.ColorDefault)
-		termbox.SetCell(i, HEIGHT-1, '-', termbox.ColorWhite, termbox.ColorDefault)
-	}
-	for i := 0; i < HEIGHT; i++ {
-		termbox.SetCell(0, i, '|', termbox.ColorWhite, termbox.ColorDefault)
-		termbox.SetCell(WIDTH-1, i, '|', termbox.ColorWhite, termbox.ColorDefault)
-	}
-
-	// render the misc border
-	for i := 0; i < WIDTH; i++ {
-		termbox.SetCell(i, 2, '-', termbox.ColorWhite, termbox.ColorDefault)
-	}
-	renderMarketPrice()
-}
-
-// U+2191 -> arrow
-func renderLine(start, end int, color termbox.Attribute) {
-	// for i := 0; i < end-start; i++ {
-	// 	termbox.SetCell(0, i, '|', termbox.ColorWhite, termbox.ColorDefault)
-	// 	termbox.SetCell(WIDTH-1, i, '|', termbox.ColorWhite, termbox.ColorDefault)
-	// }
-}
-
-func renderText(x int, y int, msg string, color termbox.Attribute) {
-	for _, ch := range msg {
-		termbox.SetCell(x, y, ch, color, termbox.ColorDefault)
-		w := runewidth.RuneWidth(ch)
-		x += w
-	}
+	return price
 }
